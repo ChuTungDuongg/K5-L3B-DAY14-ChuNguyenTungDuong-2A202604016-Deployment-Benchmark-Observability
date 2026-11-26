@@ -1,16 +1,90 @@
-# Part 6 — Final Project: Production-ready AI Agent
+# Part 6 — Production-ready AI Agent
 
-Bạn tự xây một AI agent đủ chuẩn production từ **bản khung** trong thư mục này, kết hợp mọi thứ đã học ở Part 1–5.
-Mọi file đều đã có sẵn, phần việc của bạn nằm ở các chỗ ghi `TODO`. Bản khung chạy được nhưng **chưa đạt tiêu chí nào**.
+Bản thực hành đã hoàn thiện các module trong **app/** và cấu hình Docker/Compose.
+Hợp đồng API và script chấm gốc được giữ nguyên. API dùng mock LLM, không gọi dịch vụ LLM tính phí.
 
-Bài chỉ được tính hoàn thành khi script chấm báo **`PASS 12/12`**:
+## Chạy và tự kiểm tra
+
+Từ thư mục gốc repo, mở terminal Ubuntu đã có môi trường Python:
 
 ```bash
-pip install -r requirements.txt
+cd "$LAB_ROOT/06-lab-complete"
+docker compose -p k5-day14-part6 up -d --build --wait
+docker compose -p k5-day14-part6 ps
+```
+
+Stack có một container agent (2 worker Uvicorn) và một container Redis.
+Cấu hình local trong .env đang dùng key demo **day14-lab-key**; file .env không được commit.
+Nếu clone sang máy khác, tạo .env từ .env.example rồi tự chọn key local.
+
+```bash
+curl -i http://localhost:8000/health
+curl -i http://localhost:8000/ready
+curl -i -X POST http://localhost:8000/ask -H 'Content-Type: application/json' -d '{"question":"Hello"}'
+curl -i -X POST http://localhost:8000/ask -H 'X-API-Key: day14-lab-key' -H 'Content-Type: application/json' -d '{"question":"Hello"}'
+curl -sS http://localhost:8000/usage -H 'X-API-Key: day14-lab-key'
+```
+
+Theo thứ tự: health 200, ready 200, thiếu key 401, có key 200, rồi JSON chi phí.
+Trong Part 6, key sai cũng trả 401.
+
+## Kiểm tra từng tính năng
+
+- **Readiness:** dừng Redis bằng lệnh dưới đây, /health vẫn 200 còn /ready trả 503.
+  Bật lại Redis thì /ready trở về 200.
+
+```bash
+docker compose -p k5-day14-part6 stop redis
+curl -i http://localhost:8000/health
+curl -i http://localhost:8000/ready
+docker compose -p k5-day14-part6 start redis
+```
+
+- **Rate limit:** dùng cùng API key gọi /ask liên tiếp; vượt 10 request trong 60 giây
+  sẽ nhận 429 và Retry-After. Các lần gọi trước đó trong cửa sổ 60 giây cũng được tính.
+  Restart agent không làm mất bộ đếm vì state nằm trong Redis.
+- **Cost guard:** kiểm tra ngân sách trước khi gọi LLM, ghi chi phí sau khi gọi.
+  Bộ đếm chi phí được tăng nguyên tử trong Redis, chia theo ngày/tháng UTC.
+  Giá token là giá mô phỏng trong bài, token count được ước lượng từ số từ.
+- **Demo 402:** cấu hình riêng một API key thử nghiệm với ngân sách ngày bằng 0:
+
+```bash
+AGENT_API_KEY=day14-budget-demo DAILY_BUDGET_USD=0 docker compose -p k5-day14-part6 up -d --wait
+curl -i -X POST http://localhost:8000/ask -H 'X-API-Key: day14-budget-demo' -H 'Content-Type: application/json' -d '{"question":"Hello"}'
+docker compose -p k5-day14-part6 up -d --wait
+```
+
+Lệnh cuối khôi phục cấu hình từ .env / môi trường terminal ban đầu.
+- **Log:** xem JSON bằng docker compose -p k5-day14-part6 logs agent.
+  API key và nội dung câu hỏi không được ghi vào log ứng dụng.
+- **Shutdown:** Uvicorn dùng 2 worker và nhận SIGTERM trực tiếp ở PID 1.
+  Uvicorn chờ request đang chạy trước khi gọi phần cleanup trong lifespan.
+- **Dữ liệu Redis:** Compose bật AOF và volume redis_data; không tự xoá volume khi down.
+  Chỉ xoá volume khi chủ động muốn reset dữ liệu.
+
+## Kiểm tra đầy đủ
+
+```bash
+source "$LAB_ROOT/.venv/bin/activate"
 python check_production_ready.py
 ```
 
----
+Kết quả đã chạy ngày 2026-11-26: **PASS 12/12, 43/43 checks passed**.
+Bản log đầy đủ tại **../.local-lab/part6-check.log**. Script chấm không được sửa.
+Kiểm tra bổ sung: 20 request đồng thời qua 2 worker cho 10 mã 200 và 10 mã 429;
+ngân sách tháng bằng 0 với ngân sách ngày 1000 trả 402.
+
+PASS 12/12 ở đây bao gồm cấu hình sẵn sàng deploy. Chưa tạo URL cloud; CP6 là bước
+deploy thư mục này cùng Redis và tự kiểm tra URL public.
+
+## Cách đọc code
+
+- **app/main.py:** các endpoint, middleware log JSON, lifecycle.
+- **app/config.py:** đọc environment / .env.
+- **app/auth.py:** kiểm tra X-API-Key.
+- **app/redis_client.py:** tạo client kết nối lười; readiness ping Redis.
+- **app/rate_limiter.py:** Redis sorted set + Lua, sliding window 60 giây.
+- **app/cost_guard.py:** chi phí theo API key đã băm, ngày/tháng; bộ đếm nanodollar.
 
 ## Checklist Deliverable
 
@@ -52,24 +126,24 @@ Script tự khởi động agent của bạn, gọi API thật, build và chạy
 
 ---
 
-## Bản khung
+## Các thành phần
 
 ```
 06-lab-complete/
 ├── app/
-│   ├── main.py           # TODO: /health, /ready, nối auth + rate limit + cost guard vào /ask, log JSON, shutdown
-│   ├── config.py         # TODO: đọc cấu hình từ biến môi trường
-│   ├── auth.py           # TODO: verify_api_key → 401
-│   ├── rate_limiter.py   # TODO: check_rate_limit → 429 (Redis)
-│   ├── cost_guard.py     # TODO: check_budget → 402, record_cost (Redis)
-│   └── redis_client.py   # TODO: kết nối Redis + redis_healthy() cho /ready
+│   ├── main.py           # /health, /ready, nối auth + rate limit + cost guard vào /ask, log JSON, shutdown
+│   ├── config.py         # đọc cấu hình từ biến môi trường
+│   ├── auth.py           # verify_api_key → 401
+│   ├── rate_limiter.py   # check_rate_limit → 429 (Redis)
+│   ├── cost_guard.py     # check_budget → 402, record_cost (Redis)
+│   └── redis_client.py   # kết nối Redis + redis_healthy() cho /ready
 ├── utils/mock_llm.py     # Mock LLM — có sẵn, không cần sửa
-├── Dockerfile            # TODO: viết lại thành multi-stage production
-├── docker-compose.yml    # TODO: thêm redis
+├── Dockerfile            # viết lại thành multi-stage production
+├── docker-compose.yml    # thêm redis
 ├── .dockerignore         # TODO
-├── .env.example          # TODO: liệt kê đủ biến
-├── railway.toml          # TODO (hoặc render.yaml)
-├── render.yaml           # TODO (hoặc railway.toml)
+├── .env.example          # liệt kê đủ biến
+├── railway.toml          # (hoặc render.yaml)
+├── render.yaml           # (hoặc railway.toml)
 ├── requirements.txt      # Có sẵn
 ├── check_production_ready.py   # Script chấm — không sửa
 └── benchmark-observability/    # Part 7 — làm sau khi xong Part 6
@@ -83,10 +157,10 @@ Script tự khởi động agent của bạn, gọi API thật, build và chạy
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env
+test -f .env || cp .env.example .env
 
 # Chạy nhanh không cần Docker (cần Redis riêng nếu muốn test rate limit thật)
-AGENT_API_KEY=dev-key uvicorn app.main:app --reload
+AGENT_API_KEY=dev-key python -m uvicorn app.main:app --port "${PORT:-8000}" --workers 2
 
 # Chạy cả agent + redis
 docker compose up --build
